@@ -2,11 +2,25 @@ name: Build GL-MT5000 OpenWrt (DSA)
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (留空则用 SNAPSHOT-日期)"
+        required: false
+        default: ""
+      make_release:
+        description: "编译成功后发布到 Release"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
 
 env:
   REPO_URL: https://github.com/openwrt/openwrt
   REPO_BRANCH: openwrt-25.12
   GL_DEVICE_COMMIT: https://github.com/GLiNet-Tech/openwrt.git
+  OP_PACKAGES_FEED: https://github.com/lonesafe/op-packages.git
   OPENWRT_PATH: /mnt/openwrt
   TZ: Europe/Lisbon
 
@@ -53,9 +67,10 @@ jobs:
           cd "$OPENWRT_PATH"
           bash "$GITHUB_WORKSPACE/scripts/diy.sh"
 
-      - name: Update & install feeds (official only)
+      - name: Add, update & install feeds
         run: |
           cd "$OPENWRT_PATH"
+          printf '\nsrc-git op_packages %s\n' "$OP_PACKAGES_FEED" >> feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
@@ -65,22 +80,26 @@ jobs:
           cp "$GITHUB_WORKSPACE/config/mt5000.config" .config
           make defconfig
 
-      - name: Verify switch driver is selected
+      - name: Verify native switch driver is selected
         run: |
           cd "$OPENWRT_PATH"
-          grep -q '^CONFIG_PACKAGE_kmod-rtl8366ub=y' .config \
-            || { echo "ERROR: kmod-rtl8366ub was dropped by defconfig"; exit 1; }
-          echo "kmod-rtl8366ub: selected"
+          grep -q '^CONFIG_NET_DSA_REALTEK_RTL8366UB=y' \
+            target/linux/mediatek/filogic/config-6.12 \
+            || { echo "ERROR: native RTL8366UB DSA driver is missing"; exit 1; }
+          echo "native RTL8366UB DSA driver: selected"
 
       - name: Download sources
         run: |
           cd "$OPENWRT_PATH"
           make -j$(nproc) download || make -j1 download
 
-      - name: Compile firmware
+      - name: Compile firmware (multi-thread)
         run: |
           cd "$OPENWRT_PATH"
-          make -j$(nproc) || make -j$(nproc) || make -j1 V=s
+          # 多线程编译，失败后自动重试，最后单线程排错
+          make -j$(nproc) IGNORE_ERRORS=n \
+            || make -j$(nproc) IGNORE_ERRORS=n \
+            || make -j1 V=s
 
       - name: Collect firmware
         if: always()
@@ -88,7 +107,8 @@ jobs:
           cd "$OPENWRT_PATH"
           mkdir -p "$GITHUB_WORKSPACE/artifact"
           find bin/targets -type f \( -name '*sysupgrade.bin' -o -name '*initramfs*.bin' \
-            -o -name '*.manifest' -o -name 'config.buildinfo' \) \
+            -o -name '*.manifest' -o -name 'config.buildinfo' \
+            -o -name '*.img' \) \
             -exec cp {} "$GITHUB_WORKSPACE/artifact/" \; || true
           cp .config "$GITHUB_WORKSPACE/artifact/resolved.config" || true
           ls -la "$GITHUB_WORKSPACE/artifact/" || true
@@ -101,3 +121,31 @@ jobs:
           path: artifact/
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Determine release tag
+        if: inputs.make_release == true
+        id: tag
+        run: |
+          if [ -n "${{ inputs.release_tag }}" ]; then
+            echo "tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=SNAPSHOT-$(date +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to GitHub Release
+        if: inputs.make_release == true
+        run: |
+          cd "$GITHUB_WORKSPACE/artifact"
+          TAG="${{ steps.tag.outputs.tag }}"
+          echo "Publishing release: $TAG"
+          # 删除已存在的同名 release（用于覆盖 SNAPSHOT）
+          gh release delete "$TAG" -y --cleanup-tag 2>/dev/null || true
+          # 创建 release 并上传所有固件
+          gh release create "$TAG" \
+            --title "GL-MT5000 OpenWrt $TAG" \
+            --notes "Auto-built firmware for GL.iNet GL-MT5000 (DSA switch).
+          - sysupgrade.bin: flash image
+          - initramfs-kernel.bin: RAM-boot kernel for serial testing
+          - resolved.config: actual build config" \
+            * 2>&1 || { echo "Release failed"; exit 1; }
+          echo "Release $TAG published successfully"

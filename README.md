@@ -5,8 +5,9 @@ A **clean, minimal** build of **official OpenWrt 25.12** (kernel 6.12) for the
 as a proper **DSA** switch instead of the legacy swconfig driver.
 
 This is *vanilla OpenWrt + the not-yet-merged device support + a ported DSA
-switch driver*. It is **not** a GL.iNet firmware fork, and it carries no proxy
-stack, themes, or external feeds.
+switch driver*. It is **not** a GL.iNet firmware fork. The build also makes the
+[`lonesafe/op-packages`](https://github.com/lonesafe/op-packages) feed available
+so packages from it can be selected during configuration.
 
 ## What the build does
 
@@ -17,7 +18,8 @@ stack, themes, or external feeds.
 3. Converts the switch package from GL's **swconfig** driver to a **DSA** driver
    (`files/dsa/rtl8366ub_dsa.c`, ported from GL's kernel-5.4 code to the 6.12 DSA
    API) and installs a matching DSA device tree (`files/dsa/mt7987a-gl-mt5000.dts`).
-4. Builds a minimal image: LuCI + `ethtool`/`ip-full`/`tcpdump` for validation.
+4. Adds the `op-packages` feed, then updates and installs all feeds.
+5. Builds a minimal image: LuCI + `ethtool`/`ip-full`/`tcpdump` for validation.
 
 All of that is driven by `scripts/diy.sh` and `config/mt5000.config`.
 
@@ -63,4 +65,3 @@ config/mt5000.config          lean seed .config
 files/dsa/rtl8366ub_dsa.c     DSA driver (ported 5.4 -> 6.12)
 files/dsa/mt7987a-gl-mt5000.dts  DSA device tree
 ```
-

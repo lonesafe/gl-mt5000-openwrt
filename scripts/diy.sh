@@ -25,40 +25,41 @@ grep -q "glinet_gl-mt5000" "$FILOGIC_MK" || { echo ">> ERROR: device recipe miss
 echo ">> graft OK"
 
 # --- 2. swconfig -> DSA ----------------------------------------------------
-echo ">> Converting RTL8366UB swconfig driver -> DSA (kernel 6.12 API)"
+# Newer versions of the GL device-support branch already supply a native DSA
+# driver as OpenWrt kernel patches.  Keep the original local conversion only
+# for the older branch layout that still has package/kernel/rtl8366ub.
+if [ -d "$RTLPKG" ]; then
+  echo ">> Converting legacy RTL8366UB swconfig driver -> DSA"
 
-# Ported DSA driver + build the DSA object instead of the swconfig one
-cp "$WORKSPACE/files/dsa/rtl8366ub_dsa.c" "$RTLPKG/src/rtl8366ub_dsa.c"
-sed -i 's#^rtl8366ub-y += rtl8366ub_mdio.o#rtl8366ub-y += rtl8366ub_dsa.o#' "$RTLPKG/src/Makefile"
-sed -i '/^rtl8366ub-y += rtl8366ub_dsa.o/a rtl8366ub-y += l2.o' "$RTLPKG/src/Makefile"
-
-# Drop the swconfig package dependency (DSA core + tagger are in-kernel)
-sed -i 's#DEPENDS:=@TARGET_mediatek +kmod-swconfig#DEPENDS:=@TARGET_mediatek#' "$RTLPKG/Makefile"
-
-# Scrub swconfig leftovers ONLY from the gl-mt5000 recipe (do NOT touch other
-# devices' recipes that legitimately use swconfig, e.g. mercusys_mr85x)
-sed -i '/^define Device\/glinet_gl-mt5000$/,/^endef$/{s/ kmod-rtl8366ub-mdio//g; s/ swconfig\b//g}' "$FILOGIC_MK"
-
-# DSA device tree (switch as an mdio child, per-port user netdevs + cpu@17)
-cp "$WORKSPACE/files/dsa/mt7987a-gl-mt5000.dts" target/linux/mediatek/dts/mt7987a-gl-mt5000.dts
+  cp "$WORKSPACE/files/dsa/rtl8366ub_dsa.c" "$RTLPKG/src/rtl8366ub_dsa.c"
+  sed -i 's#^rtl8366ub-y += rtl8366ub_mdio.o#rtl8366ub-y += rtl8366ub_dsa.o#' "$RTLPKG/src/Makefile"
+  sed -i '/^rtl8366ub-y += rtl8366ub_dsa.o/a rtl8366ub-y += l2.o' "$RTLPKG/src/Makefile"
+  sed -i 's#DEPENDS:=@TARGET_mediatek +kmod-swconfig#DEPENDS:=@TARGET_mediatek#' "$RTLPKG/Makefile"
+  sed -i '/^define Device\/glinet_gl-mt5000$/,/^endef$/{s/ kmod-rtl8366ub-mdio//g; s/ swconfig\b//g}' "$FILOGIC_MK"
+  cp "$WORKSPACE/files/dsa/mt7987a-gl-mt5000.dts" target/linux/mediatek/dts/mt7987a-gl-mt5000.dts
+  grep -q "CONFIG_NET_DSA_TAG_RTL8_4=y" "$KCFG" || echo "CONFIG_NET_DSA_TAG_RTL8_4=y" >> "$KCFG"
+else
+  echo ">> Using native RTL8366UB DSA driver supplied by the GL device-support graft"
+  grep -q "CONFIG_NET_DSA_REALTEK_RTL8366UB=y" "$KCFG" \
+    || { echo ">> ERROR: native RTL8366UB DSA driver is missing from graft"; exit 1; }
+fi
 
 # GL's grafted board.d hunk inserts the gl-mt5000 case WITHOUT terminating the
 # preceding case (missing ';;') = shell syntax error. Repair the terminator AND
 # set the DSA default network (lan1/lan2 user ports, WAN on the SoC PHY eth1).
 perl -0pi -e 's/(ucidef_set_interfaces_lan_wan eth0 eth1\n)\s*glinet,gl-mt5000\)\s*\n.*?;;/$1\t\t;;\n\tglinet,gl-mt5000)\n\t\tucidef_set_interfaces_lan_wan "lan1 lan2" "eth1"\n\t\t;;/s' "$BOARDD"
 
-# Enable the RTL8_4 DSA tagger in the kernel config
-grep -q "CONFIG_NET_DSA_TAG_RTL8_4=y" "$KCFG" || echo "CONFIG_NET_DSA_TAG_RTL8_4=y" >> "$KCFG"
-
 # --- 3. Sanity gates (each can actually fail) ------------------------------
-grep -q "rtl8366ub_dsa.o" "$RTLPKG/src/Makefile" || { echo ">> ERROR: DSA object not wired into src/Makefile"; exit 1; }
-  grep -q "^rtl8366ub-y += l2.o" "$RTLPKG/src/Makefile" || { echo ">> ERROR: l2.o not wired (F7 fdb/learning/fast-age need rtksw_l2_*)"; exit 1; }
+if [ -d "$RTLPKG" ]; then
+  grep -q "rtl8366ub_dsa.o" "$RTLPKG/src/Makefile" || { echo ">> ERROR: DSA object not wired into src/Makefile"; exit 1; }
+  grep -q "^rtl8366ub-y += l2.o" "$RTLPKG/src/Makefile" || { echo ">> ERROR: l2.o not wired"; exit 1; }
+fi
 grep -q "switch@0" target/linux/mediatek/dts/mt7987a-gl-mt5000.dts || { echo ">> ERROR: DSA DTS not applied"; exit 1; }
 grep -qF 'ucidef_set_interfaces_lan_wan "lan1 lan2" "eth1"' "$BOARDD" || { echo ">> ERROR: gl-mt5000 DSA board.d line not injected"; exit 1; }
 grep -q 'glinet,gl-mt5000)' "$BOARDD" || { echo ">> ERROR: gl-mt5000 case missing from board.d"; exit 1; }
 if grep -q '17@eth0' "$BOARDD"; then echo ">> ERROR: stale swconfig ucidef_add_switch survived"; exit 1; fi
 sh -n "$BOARDD" || { echo ">> ERROR: board.d/02_network has a shell syntax error"; exit 1; }
-if grep -q 'kmod-rtl8366ub-mdio' "$FILOGIC_MK"; then echo ">> ERROR: nonexistent kmod-rtl8366ub-mdio still in DEVICE_PACKAGES"; exit 1; fi
+if [ -d "$RTLPKG" ] && grep -q 'kmod-rtl8366ub-mdio' "$FILOGIC_MK"; then echo ">> ERROR: nonexistent kmod-rtl8366ub-mdio still in DEVICE_PACKAGES"; exit 1; fi
 
 # --- 4. First-boot defaults ------------------------------------------------
 mkdir -p files/etc/uci-defaults
@@ -74,5 +75,4 @@ exit 0
 UCI
 
 echo ">> DSA conversion applied"
-
 
