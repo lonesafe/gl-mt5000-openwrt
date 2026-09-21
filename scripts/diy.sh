@@ -1,67 +1,137 @@
 #!/usr/bin/env bash
-# Graft the GL-MT5000 device support (OpenWrt PR #24237) onto official
-# openwrt-25.12, then convert the RTL8366UB (RTL8371C) switch from GL's
-# swconfig driver to a DSA driver ported to the kernel 6.12 API.
-# Run with CWD = OpenWrt source root.
+# Graft GL-MT5000 device support onto official openwrt-25.12 (kernel 6.12).
+# The GLiNet mt5000 branch is based on openwrt main (kernel 6.18), so we
+# extract files individually and adapt 6.18 -> 6.12 instead of cherry-picking
+# (which fails on directory-rename conflicts).
 set -eu
 
 WORKSPACE="${GITHUB_WORKSPACE:-$(cd "$(dirname "$0")/.." && pwd)}"
-RTLPKG=package/kernel/rtl8366ub
-BOARDD=target/linux/mediatek/filogic/base-files/etc/board.d/02_network
-FILOGIC_MK=target/linux/mediatek/image/filogic.mk
+GL_REPO="${GL_DEVICE_COMMIT:-https://github.com/GLiNet-Tech/openwrt.git}"
 KCFG=target/linux/mediatek/filogic/config-6.12
+FILOGIC_MK=target/linux/mediatek/image/filogic.mk
+BOARDD=target/linux/mediatek/filogic/base-files/etc/board.d/02_network
+PLATFORMSH=target/linux/mediatek/filogic/base-files/lib/upgrade/platform.sh
+DTS=target/linux/mediatek/dts/mt7987a-gl-mt5000.dts
 
-# --- 1. Graft the single GL device-support commit (PR #24237 head) ---------
-echo ">> Grafting GL-MT5000 device support (PR #24237) onto openwrt-25.12"
+echo ">> Fetching GL-MT5000 device support from GLiNet mt5000 branch"
 git config user.email build@local
 git config user.name mt5000-build
-git remote add glinet "${GL_DEVICE_COMMIT:-https://github.com/GLiNet-Tech/openwrt.git}" 2>/dev/null || true
-# depth>=2 so cherry-pick has the commit's PARENT as a merge base; with depth 1
-# git lacks the base and treats the whole tree as add/add conflicts.
-git fetch --depth 3 glinet mt5000
-git cherry-pick -n FETCH_HEAD || { echo ">> ERROR: graft cherry-pick failed (openwrt-25.12 drift?)"; git cherry-pick --abort 2>/dev/null || true; exit 1; }
-test -f target/linux/mediatek/dts/mt7987a-gl-mt5000.dts || { echo ">> ERROR: DTS missing after graft"; exit 1; }
-grep -q "glinet_gl-mt5000" "$FILOGIC_MK" || { echo ">> ERROR: device recipe missing after graft"; exit 1; }
-echo ">> graft OK"
+git remote add glinet "$GL_REPO" 2>/dev/null || true
+git fetch --depth 2 glinet mt5000
 
-# --- 2. swconfig -> DSA ----------------------------------------------------
-# Newer versions of the GL device-support branch already supply a native DSA
-# driver as OpenWrt kernel patches.  Keep the original local conversion only
-# for the older branch layout that still has package/kernel/rtl8366ub.
-if [ -d "$RTLPKG" ]; then
-  echo ">> Converting legacy RTL8366UB swconfig driver -> DSA"
+GL_COMMIT=FETCH_HEAD
 
-  cp "$WORKSPACE/files/dsa/rtl8366ub_dsa.c" "$RTLPKG/src/rtl8366ub_dsa.c"
-  sed -i 's#^rtl8366ub-y += rtl8366ub_mdio.o#rtl8366ub-y += rtl8366ub_dsa.o#' "$RTLPKG/src/Makefile"
-  sed -i '/^rtl8366ub-y += rtl8366ub_dsa.o/a rtl8366ub-y += l2.o' "$RTLPKG/src/Makefile"
-  sed -i 's#DEPENDS:=@TARGET_mediatek +kmod-swconfig#DEPENDS:=@TARGET_mediatek#' "$RTLPKG/Makefile"
-  sed -i '/^define Device\/glinet_gl-mt5000$/,/^endef$/{s/ kmod-rtl8366ub-mdio//g; s/ swconfig\b//g}' "$FILOGIC_MK"
-  cp "$WORKSPACE/files/dsa/mt7987a-gl-mt5000.dts" target/linux/mediatek/dts/mt7987a-gl-mt5000.dts
-  grep -q "CONFIG_NET_DSA_TAG_RTL8_4=y" "$KCFG" || echo "CONFIG_NET_DSA_TAG_RTL8_4=y" >> "$KCFG"
-else
-  echo ">> Using native RTL8366UB DSA driver supplied by the GL device-support graft"
-  grep -q "CONFIG_NET_DSA_REALTEK_RTL8366UB=y" "$KCFG" \
-    || { echo ">> ERROR: native RTL8366UB DSA driver is missing from graft"; exit 1; }
+echo ">> Extracting MT5000 files from GLiNet branch"
+
+# 1. DTS — copy directly
+git --work-tree=/tmp/gl-extract checkout "$GL_COMMIT" -- \
+  target/linux/mediatek/dts/mt7987a-gl-mt5000.dts 2>/dev/null || \
+git show "$GL_COMMIT:target/linux/mediatek/dts/mt7987a-gl-mt5000.dts" > "$DTS"
+
+# 2. Kernel patches: pending-6.18 -> pending-6.12
+mkdir -p target/linux/generic/pending-6.12
+for p in \
+  795-10-net-dsa-realtek-add-rtl8366ub.patch \
+  795-11-net-dsa-rtl8366ub-8021q-ppe-offload.patch \
+  795-12-net-mediatek-init-dummy-napi-before-netdev-registration.patch
+do
+  echo ">> Copying kernel patch: $p"
+  git show "$GL_COMMIT:target/linux/generic/pending-6.18/$p" \
+    > "target/linux/generic/pending-6.12/$p"
+done
+
+# 3. Kernel config: apply 6.18 additions to 6.12
+echo ">> Adding RTL8366UB DSA config to config-6.12"
+for cfg in CONFIG_NET_DSA_REALTEK=y CONFIG_NET_DSA_REALTEK_MDIO=y CONFIG_NET_DSA_REALTEK_RTL8366UB=y; do
+  grep -q "^$cfg" "$KCFG" || echo "$cfg" >> "$KCFG"
+done
+
+# 4. filogic.mk: extract the gl-mt5000 device block and insert after gl-mt3600be
+echo ">> Adding gl-mt5000 device definition to filogic.mk"
+git show "$GL_COMMIT:target/linux/mediatek/image/filogic.mk" > /tmp/gl-filogic.mk
+# Extract the gl-mt5000 define block
+awk '/^define Device\/glinet_gl-mt5000$/{f=1} f{print} /^endef$/{if(f){f=0}}' /tmp/gl-filogic.mk > /tmp/mt5000-define.txt
+# Also extract the TARGET_DEVICES line
+grep "TARGET_DEVICES += glinet_gl-mt5000" /tmp/gl-filogic.mk >> /tmp/mt5000-define.txt
+
+# Insert the gl-mt5000 block before the gl-mt6000 definition
+if ! grep -q "glinet_gl-mt5000" "$FILOGIC_MK"; then
+  awk '
+    /^define Device\/glinet_gl-mt6000$/ && !done {
+      while ((getline line < "/tmp/mt5000-define.txt") > 0) print line
+      close("/tmp/mt5000-define.txt")
+      done=1
+    }
+    {print}
+  ' "$FILOGIC_MK" > /tmp/filogic.mk.new && mv /tmp/filogic.mk.new "$FILOGIC_MK"
 fi
 
-# GL's grafted board.d hunk inserts the gl-mt5000 case WITHOUT terminating the
-# preceding case (missing ';;') = shell syntax error. Repair the terminator AND
-# set the DSA default network (lan1/lan2 user ports, WAN on the SoC PHY eth1).
-perl -0pi -e 's/(ucidef_set_interfaces_lan_wan eth0 eth1\n)\s*glinet,gl-mt5000\)\s*\n.*?;;/$1\t\t;;\n\tglinet,gl-mt5000)\n\t\tucidef_set_interfaces_lan_wan "lan1 lan2" "eth1"\n\t\t;;/s' "$BOARDD"
-
-# --- 3. Sanity gates (each can actually fail) ------------------------------
-if [ -d "$RTLPKG" ]; then
-  grep -q "rtl8366ub_dsa.o" "$RTLPKG/src/Makefile" || { echo ">> ERROR: DSA object not wired into src/Makefile"; exit 1; }
-  grep -q "^rtl8366ub-y += l2.o" "$RTLPKG/src/Makefile" || { echo ">> ERROR: l2.o not wired"; exit 1; }
+# 5. board.d/02_network: add gl-mt5000 case
+echo ">> Adding gl-mt5000 network config to board.d"
+if ! grep -q "glinet,gl-mt5000" "$BOARDD"; then
+  python3 - "$BOARDD" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    lines = f.readlines()
+out = []
+inserted = False
+for i, line in enumerate(lines):
+    out.append(line)
+    if not inserted and 'wavlink,wl-wnt100x3-ubootmod)' in line:
+        # skip ahead to the ;; that ends this case
+        j = i + 1
+        while j < len(lines) and ';;' not in lines[j]:
+            out.append(lines[j])
+            j += 1
+        if j < len(lines):
+            out.append(lines[j])
+            out.append('\tglinet,gl-mt5000)\n')
+            out.append('\t\tucidef_set_interfaces_lan_wan "lan1 lan2" eth1\n')
+            out.append('\t\t;;\n')
+            inserted = True
+            # consume the lines we already added so the main loop skips them
+            # by replacing them: mark indices i+1..j as consumed
+            for k in range(i + 1, j + 1):
+                lines[k] = None
+# filter out None (consumed lines)
+out = [l for l in out if l is not None]
+with open(path, 'w') as f:
+    f.writelines(out)
+PYEOF
 fi
-grep -q "switch@0" target/linux/mediatek/dts/mt7987a-gl-mt5000.dts || { echo ">> ERROR: DSA DTS not applied"; exit 1; }
-grep -qF 'ucidef_set_interfaces_lan_wan "lan1 lan2" "eth1"' "$BOARDD" || { echo ">> ERROR: gl-mt5000 DSA board.d line not injected"; exit 1; }
+
+# 6. platform.sh: add gl-mt5000 to upgrade list
+echo ">> Adding gl-mt5000 to platform.sh upgrade list"
+if ! grep -q "glinet,gl-mt5000" "$PLATFORMSH"; then
+  python3 - "$PLATFORMSH" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+content = content.replace(
+    'glinet,gl-mt2500-airoha|\\',
+    'glinet,gl-mt2500-airoha|\\\n\tglinet,gl-mt5000|\\'
+)
+with open(path, 'w') as f:
+    f.write(content)
+PYEOF
+fi
+
+# Cleanup temp files
+rm -rf /tmp/gl-extract /tmp/gl-filogic.mk /tmp/mt5000-define.txt
+
+# --- Sanity checks ---
+echo ">> Running sanity checks"
+test -f "$DTS" || { echo ">> ERROR: DTS missing"; exit 1; }
+grep -q "glinet_gl-mt5000" "$FILOGIC_MK" || { echo ">> ERROR: device recipe missing"; exit 1; }
+grep -q "CONFIG_NET_DSA_REALTEK_RTL8366UB=y" "$KCFG" || { echo ">> ERROR: RTL8366UB config missing"; exit 1; }
 grep -q 'glinet,gl-mt5000)' "$BOARDD" || { echo ">> ERROR: gl-mt5000 case missing from board.d"; exit 1; }
-if grep -q '17@eth0' "$BOARDD"; then echo ">> ERROR: stale swconfig ucidef_add_switch survived"; exit 1; fi
-sh -n "$BOARDD" || { echo ">> ERROR: board.d/02_network has a shell syntax error"; exit 1; }
-if [ -d "$RTLPKG" ] && grep -q 'kmod-rtl8366ub-mdio' "$FILOGIC_MK"; then echo ">> ERROR: nonexistent kmod-rtl8366ub-mdio still in DEVICE_PACKAGES"; exit 1; fi
+grep -q 'glinet,gl-mt5000' "$PLATFORMSH" || { echo ">> ERROR: gl-mt5000 missing from platform.sh"; exit 1; }
+sh -n "$BOARDD" || { echo ">> ERROR: board.d has syntax error"; exit 1; }
+test -f target/linux/generic/pending-6.12/795-10-net-dsa-realtek-add-rtl8366ub.patch || { echo ">> ERROR: DSA patch missing"; exit 1; }
 
-# --- 4. First-boot defaults ------------------------------------------------
+# --- First-boot defaults ---
 mkdir -p files/etc/uci-defaults
 cat > files/etc/uci-defaults/99-gl-mt5000 <<'UCI'
 #!/bin/sh
@@ -74,5 +144,4 @@ EOF
 exit 0
 UCI
 
-echo ">> DSA conversion applied"
-
+echo ">> MT5000 device support applied successfully"
