@@ -29,16 +29,64 @@ git --work-tree=/tmp/gl-extract checkout "$GL_COMMIT" -- \
 git show "$GL_COMMIT:target/linux/mediatek/dts/mt7987a-gl-mt5000.dts" > "$DTS"
 
 # 2. Kernel patches: pending-6.18 -> pending-6.12
+# NOTE: 795-11 (8021Q PPE offload) and 795-12 (mtk dummy NAPI) are skipped
+# because they depend on kernel 6.18 APIs not present in 6.12. The core DSA
+# driver (795-10) is sufficient for basic switch functionality.
 mkdir -p target/linux/generic/pending-6.12
 for p in \
-  795-10-net-dsa-realtek-add-rtl8366ub.patch \
-  795-11-net-dsa-rtl8366ub-8021q-ppe-offload.patch \
-  795-12-net-mediatek-init-dummy-napi-before-netdev-registration.patch
+  795-10-net-dsa-realtek-add-rtl8366ub.patch
 do
   echo ">> Copying kernel patch: $p"
   git show "$GL_COMMIT:target/linux/generic/pending-6.18/$p" \
     > "target/linux/generic/pending-6.12/$p"
 done
+
+# 2b. Fix 795-10 Makefile hunk for kernel 6.12 (6.18 Makefile has multi-line
+#     rtl8365mb-objs; 6.12 is single-line). Replace the hunk to append at EOF.
+echo ">> Adapting 795-10 Makefile hunk for kernel 6.12"
+python3 - target/linux/generic/pending-6.12/795-10-net-dsa-realtek-add-rtl8366ub.patch <<'PYEOF'
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+# Match the entire Makefile hunk (from @@ ... Makefile to the next diff --git)
+pattern = re.compile(
+    r'(diff --git a/drivers/net/dsa/realtek/Makefile b/drivers/net/dsa/realtek/Makefile\n'
+    r'index [^\n]+\n'
+    r'--- a/drivers/net/dsa/realtek/Makefile\n'
+    r'\+\+\+ b/drivers/net/dsa/realtek/Makefile\n)'
+    r'(@@.*?\n)'
+    r'(.*?)(?=diff --git|\Z)',
+    re.DOTALL
+)
+
+m = pattern.search(content)
+if m:
+    header = m.group(1)
+    # New hunk: match the last line of 6.12 Makefile and append rtl8366ub block
+    new_hunk = "@@ -11,1 +11,14 @@ obj-$(CONFIG_NET_DSA_REALTEK_RTL8365MB) += rtl8365mb.o\n"
+    new_hunk += "+\n"
+    new_hunk += "+obj-$(CONFIG_NET_DSA_REALTEK_RTL8366UB) += rtl8366ub.o\n"
+    new_hunk += "+rtl8366ub-objs := rtl8366ub_reg.o \\\n"
+    new_hunk += "+\t\trtl8366ub_init.o \\\n"
+    new_hunk += "+\t\trtl8366ub_core.o \\\n"
+    new_hunk += "+\t\trtl8366ub_port.o \\\n"
+    new_hunk += "+\t\trtl8366ub_cpu.o \\\n"
+    new_hunk += "+\t\trtl8366ub_switch.o \\\n"
+    new_hunk += "+\t\trtl8366ub_table.o \\\n"
+    new_hunk += "+\t\trtl8366ub_l2.o \\\n"
+    new_hunk += "+\t\trtl8366ub_mib.o \\\n"
+    new_hunk += "+\t\trtl8366ub_dsa.o \\\n"
+    new_hunk += "+\t\trtl8366ub_phy.o\n\n"
+    replacement = header + new_hunk
+    content = content[:m.start()] + replacement + content[m.end():]
+    with open(path, 'w') as f:
+        f.write(content)
+    print("  Makefile hunk adapted for 6.12")
+else:
+    print("  WARNING: Makefile hunk not found")
+PYEOF
 
 # 3. Kernel config: apply 6.18 additions to 6.12
 echo ">> Adding RTL8366UB DSA config to config-6.12"
