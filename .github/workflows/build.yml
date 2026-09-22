@@ -113,6 +113,10 @@ jobs:
                    luci-app-ttyd luci-app-tcpdump luci-app-upnp luci-app-vlmcsd xl2tpd; do
             sed -i "s/^# CONFIG_PACKAGE_$p is not set$/CONFIG_PACKAGE_$p=m/" .config
           done
+          # ttyd depends on libwebsockets-full (built with -DLWS_WITH_LIBUV=ON).
+          # Without this variant selected the default libwebsockets lacks libuv and
+          # ttyd's CMake configure aborts ("libwebsockets was not build with libuv").
+          echo 'CONFIG_PACKAGE_libwebsockets-full=m' >> .config
           echo "luci/plugin modules selected: $(grep -c '^CONFIG_PACKAGE_luci-.*=m' .config)"
           echo "kmod modules selected: $(grep -c '^CONFIG_PACKAGE_kmod-.*=m' .config)"
 
@@ -134,8 +138,13 @@ jobs:
           cd "$OPENWRT_PATH"
           # IGNORE_ERRORS=y: a single broken package (e.g. an incompatible
           # community feed) must not abort the whole library build.
+          # The trailing `|| true` is a last-resort safety net: even if a package
+          # configure/build error escapes IGNORE_ERRORS and drops the package_compile
+          # stamp, we still proceed to collect artefacts, build the opkg index and
+          # publish the release (with a note on which plugins failed to compile).
           make -j$(nproc) IGNORE_ERRORS=y V=sc \
-            || make -j1 V=s IGNORE_ERRORS=y
+            || make -j1 V=s IGNORE_ERRORS=y \
+            || echo "warn: compile finished with errors; publishing partial library"
 
       - name: Collect firmware
         if: always()
