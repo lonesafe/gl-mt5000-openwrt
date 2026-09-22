@@ -136,6 +136,8 @@ jobs:
 
       - name: Publish to GitHub Release
         if: inputs.make_release == true
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           cd "$GITHUB_WORKSPACE/artifact"
           TAG="${{ steps.tag.outputs.tag }}"
