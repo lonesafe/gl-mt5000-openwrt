@@ -77,17 +77,21 @@ jobs:
 
           # ---- Extra feeds for requested plugins ----
           src-git op_packages $OP_PACKAGES_FEED
-          src-git passwall https://github.com/xiaorouji/openwrt-passwall.git;main
+          # passwall (LuCI app) — repo moved from xiaorouji to the Openwrt-Passwall org
+          src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git;main
           src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main
           src-git diskman https://github.com/lisaac/luci-app-diskman.git;master
           src-git dockerman https://github.com/lisaac/luci-app-dockerman.git;master
-          src-git vlmcsd https://github.com/rufengsuixing/luci-app-vlmcsd.git;master
+          # vlmcsd daemon + luci-app-vlmcsd bundled as a single feed
+          src-git kms https://github.com/gaoderby/luci-app-kms.git;main
           EOF
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a || true
-          # ensure the explicitly requested packages are installed (best-effort)
+          # A single unreachable/unsupported feed must NOT abort the whole fetch.
+          ./scripts/feeds update -a || echo "warn: some feeds failed to update"
+          ./scripts/feeds install -a || echo "warn: some feeds failed to install"
+          # Ensure the explicitly requested packages are installed (best-effort).
           for p in luci-app-ddns luci-app-diskman luci-app-dockerman luci-app-passwall \
-                   luci-app-ttyd luci-app-tcpdump luci-app-upnp luci-app-vlmcsd xl2tpd; do
+                   luci-app-ttyd luci-app-tcpdump luci-app-upnp luci-app-vlmcsd \
+                   vlmcsd xl2tpd; do
             ./scripts/feeds install "$p" 2>/dev/null \
               || echo "warn: $p could not be installed (likely incompatible with this kernel)"
           done
@@ -150,7 +154,11 @@ jobs:
         run: |
           cd "$OPENWRT_PATH"
           # Regenerate the opkg Packages indices from everything we built.
-          make package/index
+          # .config exists by now, so this stays non-interactive. If it ever
+          # tries an interactive config (no TTY), fall back to the build-time
+          # indices that `make` already produced.
+          make package/index 2>/dev/null \
+            || echo "warn: index regen skipped, using build-time indices"
           cd "$GITHUB_WORKSPACE"
           mkdir -p repo
           # Preserve the bin/ directory structure so opkg can use it directly.
