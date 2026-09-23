@@ -108,14 +108,28 @@ jobs:
           echo 'CONFIG_AUTOREMOVE=y' >> .config
           make defconfig
 
-          # Turn every available luci package into a module.
-          perl -0pi -e 's/^# (CONFIG_PACKAGE_luci-[^\s=]+) is not set$/$1=m/mg' .config
+          # Turn every available luci *application* into a module.
+          # IMPORTANT: only luci-app-* (apps), NOT luci-lib-* (libraries).
+          # Libraries like luci-lib-ip link against liblua; forcing them to =m
+          # standalone breaks the packaging step ('missing dependencies:
+          # liblua.so') and aborts 'make world' before the firmware is built.
+          # Leaving libraries to dependency resolution lets OpenWrt pull in
+          # liblua + the needed luci-lib-* automatically.
+          perl -0pi -e 's/^# (CONFIG_PACKAGE_luci-app-[^\s=]+) is not set$/$1=m/mg' .config
 
           # Explicitly select requested apps.
           for p in luci-app-ddns luci-app-diskman luci-app-dockerman luci-app-passwall \
                    luci-app-upnp luci-app-vlmcsd xl2tpd; do
             sed -i "s/^# CONFIG_PACKAGE_$p is not set$/CONFIG_PACKAGE_$p=m/" .config
           done
+
+          # Re-run defconfig so the new module selections correctly pull in
+          # their library dependencies (liblua, luci-lib-*, etc.).
+          make defconfig
+
+          # Make sure liblua is available (luci-lib-ip links against it).
+          grep -q '^CONFIG_PACKAGE_liblua=' .config || echo 'CONFIG_PACKAGE_liblua=m' >> .config
+          make defconfig
 
           # Verify disables
           grep -q '^CONFIG_PACKAGE_ttyd=n'                .config && echo "ttyd: DISABLED (libwebsockets libuv mismatch)"
